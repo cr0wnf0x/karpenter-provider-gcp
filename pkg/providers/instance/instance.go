@@ -32,8 +32,10 @@ import (
 	"google.golang.org/api/compute/v1"
 	"google.golang.org/api/googleapi"
 	corev1 "k8s.io/api/core/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
@@ -46,6 +48,7 @@ import (
 	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/providers/metadata"
 	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/providers/nodepooltemplate"
 	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/utils"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 const (
@@ -77,10 +80,11 @@ type DefaultProvider struct {
 	projectID             string
 	defaultServiceAccount string
 	computeService        *compute.Service
+	kubeClient            client.Client
 }
 
 func NewProvider(clusterName, region, projectID, defaultServiceAccount string, computeService *compute.Service, gkeProvider gke.Provider,
-	unavailableOfferings *pkgcache.UnavailableOfferings) Provider {
+	unavailableOfferings *pkgcache.UnavailableOfferings, kubeClient client.Client) Provider {
 	return &DefaultProvider{
 		gkeProvider:           gkeProvider,
 		unavailableOfferings:  unavailableOfferings,
@@ -90,6 +94,7 @@ func NewProvider(clusterName, region, projectID, defaultServiceAccount string, c
 		projectID:             projectID,
 		defaultServiceAccount: defaultServiceAccount,
 		computeService:        computeService,
+		kubeClient:            kubeClient,
 	}
 }
 
@@ -199,6 +204,33 @@ func (p *DefaultProvider) Create(ctx context.Context, nodeClass *v1alpha1.GCENod
 				errs = append(errs, err)
 				continue
 			}
+
+			// Create the Node object in Kubernetes.
+			node := &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:   instanceName,
+					Labels: instance.Labels,
+				},
+				Spec: corev1.NodeSpec{
+					ProviderID: fmt.Sprintf("gce://%s/%s/%s", p.projectID, zone, instanceName),
+				},
+			}
+			if err := p.kubeClient.Create(ctx, node); err != nil {
+				log.FromContext(ctx).Error(err, "failed to create node object", "instanceName", instanceName)
+				return nil, fmt.Errorf("failed to create node object: %w", err)
+			}
+
+			if err := p.waitForNodeReady(ctx, instanceName); err != nil {
+				log.FromContext(ctx).Error(err, "failed to wait for node to be ready", "instanceName", instanceName)
+				return nil, fmt.Errorf("failed to wait for node to be ready: %w", err)
+			}
+
+			// Get the node and update the nodeclaim with the podCIDR
+			if err := p.kubeClient.Get(ctx, client.ObjectKey{Name: instanceName}, node); err != nil {
+				log.FromContext(ctx).Error(err, "failed to get node", "instanceName", instanceName)
+				return nil, fmt.Errorf("failed to get node: %w", err)
+			}
+			nodeClaim.Status.ProviderID = node.Spec.ProviderID
 		}
 
 		// we could wait for the node to be present in kubernetes api via csr sign up
@@ -693,4 +725,33 @@ func (p *DefaultProvider) resolveServiceAccount(nodeClass *v1alpha1.GCENodeClass
 		return nodeClass.Spec.ServiceAccount
 	}
 	return p.defaultServiceAccount
+}
+
+func (p *DefaultProvider) waitForNodeReady(ctx context.Context, instanceName string) error {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	timeout := time.NewTimer(5 * time.Minute)
+	defer timeout.Stop()
+
+	for {
+		select {
+		case <-timeout.C:
+			return fmt.Errorf("timed out waiting for node to be ready")
+		case <-ticker.C:
+			var node corev1.Node
+			if err := p.kubeClient.Get(ctx, client.ObjectKey{Name: instanceName}, &node); err != nil {
+				if k8serrors.IsNotFound(err) {
+					continue
+				}
+				return fmt.Errorf("getting node: %w", err)
+			}
+
+			for _, condition := range node.Status.Conditions {
+				if condition.Type == corev1.NodeReady && condition.Status == corev1.ConditionTrue {
+					return nil
+				}
+			}
+		}
+	}
 }
