@@ -18,38 +18,150 @@ package nodepooltemplate
 
 import (
 	"context"
-	"time"
+	"fmt"
 
-	"github.com/awslabs/operatorpkg/singleton"
-	controllerruntime "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"github.com/mitchellh/hashstructure/v2"
+	"github.com/samber/lo"
+	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-	"sigs.k8s.io/karpenter/pkg/operator/injection"
+	"sigs.k8s.io/karpenter/pkg/apis/v1"
 
+	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/apis/v1alpha1"
 	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/providers/nodepooltemplate"
+
+	controllerruntime "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 )
 
+const (
+	finalizer       = "karpenter.k8s.gcp/nodepooltemplate"
+	annotationKey   = "karpenter.k8s.gcp/gcenodeclass-hash"
+)
+
+// Controller for the resource
 type Controller struct {
+	kubeClient               client.Client
 	nodePoolTemplateProvider nodepooltemplate.Provider
 }
 
-func NewController(nodePooltemplateProvider nodepooltemplate.Provider) *Controller {
+// NewController is a constructor
+func NewController(kubeClient client.Client, nodePoolTemplateProvider nodepooltemplate.Provider) *Controller {
 	return &Controller{
-		nodePoolTemplateProvider: nodePooltemplateProvider,
+		kubeClient:               kubeClient,
+		nodePoolTemplateProvider: nodePoolTemplateProvider,
 	}
 }
 
-func (c *Controller) Reconcile(ctx context.Context) (reconcile.Result, error) {
-	ctx = injection.WithControllerName(ctx, "nodepooltemplate")
-	if err := c.nodePoolTemplateProvider.Create(ctx); err != nil {
+// Reconcile executes a termination control loop for the resource
+func (c *Controller) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
+	// 1. Read the nodepool
+	nodePool := &v1.NodePool{}
+	if err := c.kubeClient.Get(ctx, req.NamespacedName, nodePool); err != nil {
+		if errors.IsNotFound(err) {
+			return reconcile.Result{}, nil
+		}
 		return reconcile.Result{}, err
 	}
-	return reconcile.Result{RequeueAfter: 12 * time.Minute}, nil
+
+	// 2. Read the gce node class
+	gceNodeClass := &v1alpha1.GCENodeClass{}
+	if err := c.kubeClient.Get(ctx, types.NamespacedName{Name: nodePool.Spec.Template.Spec.NodeClassRef.Name}, gceNodeClass); err != nil {
+		if errors.IsNotFound(err) {
+			// If the node class doesn't exist, we don't need to do anything.
+			// If the node pool is deleted, the finalizer will be removed.
+			return reconcile.Result{}, nil
+		}
+		return reconcile.Result{}, err
+	}
+
+	// 3. Handle deletion
+	if !nodePool.DeletionTimestamp.IsZero() {
+		return c.delete(ctx, nodePool, gceNodeClass)
+	}
+
+	// 4. Add finalizer
+	if !controllerutil.ContainsFinalizer(nodePool, finalizer) {
+		controllerutil.AddFinalizer(nodePool, finalizer)
+		if err := c.kubeClient.Update(ctx, nodePool); err != nil {
+			return reconcile.Result{}, err
+		}
+	}
+
+	// 5. Reconcile the nodepool template
+	if err := c.nodePoolTemplateProvider.Create(ctx, gceNodeClass, nodePool); err != nil {
+		return reconcile.Result{}, err
+	}
+
+	// 6. Calculate hash and annotate nodepool
+	hash, err := c.calculateHash(gceNodeClass)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+
+	if nodePool.Annotations[annotationKey] != hash {
+		patch := client.MergeFrom(nodePool.DeepCopy())
+		if nodePool.Annotations == nil {
+			nodePool.Annotations = make(map[string]string)
+		}
+		nodePool.Annotations[annotationKey] = hash
+		if err := c.kubeClient.Patch(ctx, nodePool, patch); err != nil {
+			return reconcile.Result{}, err
+		}
+	}
+
+	return reconcile.Result{}, nil
+}
+
+func (c *Controller) delete(ctx context.Context, nodePool *v1.NodePool, gceNodeClass *v1alpha1.GCENodeClass) (reconcile.Result, error) {
+	if !controllerutil.ContainsFinalizer(nodePool, finalizer) {
+		return reconcile.Result{}, nil
+	}
+
+	if err := c.nodePoolTemplateProvider.Delete(ctx, gceNodeClass); err != nil {
+		return reconcile.Result{}, err
+	}
+
+	controllerutil.RemoveFinalizer(nodePool, finalizer)
+	if err := c.kubeClient.Update(ctx, nodePool); err != nil {
+		return reconcile.Result{}, err
+	}
+
+	return reconcile.Result{}, nil
+}
+
+func (c *Controller) calculateHash(gceNodeClass *v1alpha1.GCENodeClass) (string, error) {
+	hash, err := hashstructure.Hash(gceNodeClass.Spec, hashstructure.FormatV2, nil)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%d", hash), nil
 }
 
 func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 	return controllerruntime.NewControllerManagedBy(m).
+		For(&v1.NodePool{}).
+		Watches(
+			&v1alpha1.GCENodeClass{},
+			handler.EnqueueRequestsFromMapFunc(c.nodeClassToNodePool),
+		).
 		Named("nodepooltemplate").
-		WatchesRawSource(singleton.Source()).
-		Complete(singleton.AsReconciler(c))
+		Complete(c)
+}
+
+func (c *Controller) nodeClassToNodePool(ctx context.Context, obj client.Object) []reconcile.Request {
+	var nodePools v1.NodePoolList
+	if err := c.kubeClient.List(ctx, &nodePools); err != nil {
+		return nil
+	}
+
+	return lo.FilterMap(nodePools.Items, func(np v1.NodePool, _ int) (reconcile.Request, bool) {
+		if np.Spec.Template.Spec.NodeClassRef.Name == obj.GetName() {
+			return reconcile.Request{NamespacedName: types.NamespacedName{Name: np.Name}}, true
+		}
+		return reconcile.Request{}, false
+	})
 }
