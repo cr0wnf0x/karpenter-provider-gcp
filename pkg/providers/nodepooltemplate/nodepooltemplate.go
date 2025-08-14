@@ -29,6 +29,7 @@ import (
 	"google.golang.org/api/compute/v1"
 	"google.golang.org/api/container/v1"
 	"google.golang.org/api/googleapi"
+	"github.com/samber/lo"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -132,7 +133,7 @@ func (p *DefaultProvider) Create(ctx context.Context, nodeClass *v1alpha1.GCENod
 		maxPods = int64(*nodeClass.Spec.KubeletConfiguration.MaxPods)
 	}
 
-	if err := p.ensureNodePoolTemplate(ctx, imageType, nodePoolName, p.defaultServiceAccount, maxPods); err != nil {
+	if err := p.ensureNodePoolTemplate(ctx, imageType, nodePoolName, p.defaultServiceAccount, maxPods, nodePool); err != nil {
 		log.FromContext(ctx).Error(err, "failed to ensure node pool template", "nodeClass", nodeClass.Name)
 		return err
 	}
@@ -185,7 +186,7 @@ func (p *DefaultProvider) resolveImageType(imageFamily string) (string, error) {
 	}
 }
 
-func (p *DefaultProvider) ensureNodePoolTemplate(ctx context.Context, imageType, nodePoolName, serviceAccount string, maxPods int64) error {
+func (p *DefaultProvider) ensureNodePoolTemplate(ctx context.Context, imageType, nodePoolName, serviceAccount string, maxPods int64, nodePool *v1.NodePool) error {
 	logger := log.FromContext(ctx)
 	nodePoolSelfLink := fmt.Sprintf("projects/%s/locations/%s/clusters/%s/nodePools/%s",
 		p.ClusterInfo.ProjectID, p.ClusterInfo.Region, p.ClusterInfo.Name, nodePoolName)
@@ -194,7 +195,7 @@ func (p *DefaultProvider) ensureNodePoolTemplate(ctx context.Context, imageType,
 	if err != nil {
 		var gcpErr *googleapi.Error
 		if errors.As(err, &gcpErr) && gcpErr.Code == http.StatusNotFound {
-			return p.createNodePoolTemplate(ctx, imageType, nodePoolName, serviceAccount, maxPods)
+			return p.createNodePoolTemplate(ctx, imageType, nodePoolName, serviceAccount, maxPods, nodePool)
 		}
 		logger.Error(err, "failed to get node pool", "name", nodePoolName)
 		return err
@@ -206,13 +207,13 @@ func (p *DefaultProvider) ensureNodePoolTemplate(ctx context.Context, imageType,
 		if err := p.Delete(ctx, &v1alpha1.GCENodeClass{ObjectMeta: metav1.ObjectMeta{Name: strings.TrimPrefix(nodePoolName, "karpenter-")}}); err != nil {
 			return err
 		}
-		return p.createNodePoolTemplate(ctx, imageType, nodePoolName, serviceAccount, maxPods)
+		return p.createNodePoolTemplate(ctx, imageType, nodePoolName, serviceAccount, maxPods, nodePool)
 	}
 
 	return nil
 }
 
-func (p *DefaultProvider) createNodePoolTemplate(ctx context.Context, imageType, nodePoolName, serviceAccount string, maxPods int64) error {
+func (p *DefaultProvider) createNodePoolTemplate(ctx context.Context, imageType, nodePoolName, serviceAccount string, maxPods int64, nodePool *v1.NodePool) error {
 	logger := log.FromContext(ctx)
 	logger.Info("creating node pool template", "name", nodePoolName)
 
@@ -223,6 +224,19 @@ func (p *DefaultProvider) createNodePoolTemplate(ctx context.Context, imageType,
 		return err
 	}
 
+	var nodepoolZones *v1.NodeSelectorRequirementWithMinValues
+	for i := range nodePool.Spec.Template.Spec.Requirements {
+		if nodePool.Spec.Template.Spec.Requirements[i].Key == "topology.kubernetes.io/zone" {
+			nodepoolZones = &nodePool.Spec.Template.Spec.Requirements[i]
+			break
+		}
+	}
+
+	if nodepoolZones == nil {
+		return fmt.Errorf("no zones specified in nodepool %s", nodePool.Name)
+	}
+	zones := lo.Intersect(p.ClusterInfo.Zones, nodepoolZones.Values)
+
 	nodePoolOpts := &container.CreateNodePoolRequest{
 		NodePool: &container.NodePool{
 			Name: nodePoolName,
@@ -230,7 +244,7 @@ func (p *DefaultProvider) createNodePoolTemplate(ctx context.Context, imageType,
 				Enabled: false,
 			},
 			InitialNodeCount: 0,
-			Locations:        p.ClusterInfo.Zones,
+			Locations:        zones,
 			Config: &container.NodeConfig{
 				ImageType:      imageType,
 				ServiceAccount: serviceAccount,
