@@ -24,18 +24,25 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 
+	"github.com/samber/lo"
 	"google.golang.org/api/compute/v1"
 	"google.golang.org/api/container/v1"
 	"google.golang.org/api/googleapi"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 
+	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/apis/v1alpha1"
 	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/providers/version"
+	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/utils"
 )
 
 type Provider interface {
-	Create(ctx context.Context) error
+	Create(ctx context.Context, nodeClass *v1alpha1.GCENodeClass, nodePool *v1.NodePool) error
+	Delete(ctx context.Context, nodeClass *v1alpha1.GCENodeClass) error
 	GetInstanceTemplates(ctx context.Context) (map[string]*compute.InstanceTemplate, error)
 }
 
@@ -114,81 +121,195 @@ func resolveZones(ctx context.Context, computeService *compute.Service, projectI
 	return zones, nil
 }
 
-// creating both default nodepool templates could be run concurrently
-func (p *DefaultProvider) Create(ctx context.Context) error {
-	if err := p.ensureKarpenterNodePoolTemplate(ctx, KarpenterDefaultNodePoolTemplateImageType, KarpenterDefaultNodePoolTemplate, p.defaultServiceAccount); err != nil {
+func (p *DefaultProvider) Create(ctx context.Context, nodeClass *v1alpha1.GCENodeClass, nodePool *v1.NodePool) error {
+	nodePoolName := utils.ResolveNodePoolName(nodeClass.Name)
+	imageType, err := p.resolveImageType(nodeClass.ImageFamily())
+	if err != nil {
+		log.FromContext(ctx).Error(err, "failed to resolve image type", "nodeClass", nodeClass.Name)
 		return err
 	}
 
-	if err := p.ensureKarpenterNodePoolTemplate(ctx, KarpenterUbuntuNodePoolTemplateImageType, KarpenterUbuntuNodePoolTemplate, p.defaultServiceAccount); err != nil {
+	var maxPods int64 = v1alpha1.KubeletMaxPods
+	if nodeClass.Spec.KubeletConfiguration != nil && nodeClass.Spec.KubeletConfiguration.MaxPods != nil {
+		maxPods = int64(*nodeClass.Spec.KubeletConfiguration.MaxPods)
+	}
+
+	if err := p.ensureNodePoolTemplate(ctx, imageType, nodePoolName, p.defaultServiceAccount, maxPods, nodePool); err != nil {
+		log.FromContext(ctx).Error(err, "failed to ensure node pool template", "nodeClass", nodeClass.Name)
 		return err
+	}
+	return nil
+}
+
+func (p *DefaultProvider) Delete(ctx context.Context, nodeClass *v1alpha1.GCENodeClass) error {
+	nodePoolName := utils.ResolveNodePoolName(nodeClass.Name)
+	logger := log.FromContext(ctx)
+	logger.Info("deleting node pool template", "name", nodePoolName)
+
+	nodePoolSelfLink := fmt.Sprintf("projects/%s/locations/%s/clusters/%s/nodePools/%s",
+		p.ClusterInfo.ProjectID, p.ClusterInfo.Region, p.ClusterInfo.Name, nodePoolName)
+
+	op, err := p.containerService.Projects.Locations.Clusters.NodePools.Delete(nodePoolSelfLink).Context(ctx).Do()
+	if err != nil {
+		var gcpErr *googleapi.Error
+		if errors.As(err, &gcpErr) {
+			if gcpErr.Code == http.StatusNotFound {
+				logger.Info("node pool template already deleted", "name", nodePoolName)
+				return nil
+			}
+			if gcpErr.Code == http.StatusBadRequest && strings.Contains(gcpErr.Message, "CLUSTER_ALREADY_HAS_OPERATION") {
+				logger.Info("cluster has a conflicting operation in progress, requeueing delete", "name", nodePoolName)
+				return fmt.Errorf("cluster has a conflicting operation in progress")
+			}
+		}
+		logger.Error(err, "failed to delete node pool template", "name", nodePoolName)
+		return err
+	}
+	if err := p.waitForOperation(ctx, op); err != nil {
+		return err
+	}
+	logger.Info("node pool template deleted", "name", nodePoolName)
+	return nil
+}
+
+func (p *DefaultProvider) resolveImageType(imageFamily string) (string, error) {
+	switch imageFamily {
+	case v1alpha1.ImageFamilyContainerOptimizedOS:
+		return KarpenterDefaultNodePoolTemplateImageType, nil
+	case v1alpha1.ImageFamilyUbuntu:
+		return KarpenterUbuntuNodePoolTemplateImageType, nil
+	default:
+		return "", fmt.Errorf("unsupported image family %q", imageFamily)
+	}
+}
+
+func (p *DefaultProvider) ensureNodePoolTemplate(ctx context.Context, imageType, nodePoolName, serviceAccount string, maxPods int64, nodePool *v1.NodePool) error {
+	logger := log.FromContext(ctx)
+	nodePoolSelfLink := fmt.Sprintf("projects/%s/locations/%s/clusters/%s/nodePools/%s",
+		p.ClusterInfo.ProjectID, p.ClusterInfo.Region, p.ClusterInfo.Name, nodePoolName)
+
+	existing, err := p.containerService.Projects.Locations.Clusters.NodePools.Get(nodePoolSelfLink).Context(ctx).Do()
+	if err != nil {
+		var gcpErr *googleapi.Error
+		if errors.As(err, &gcpErr) && gcpErr.Code == http.StatusNotFound {
+			return p.createNodePoolTemplate(ctx, imageType, nodePoolName, serviceAccount, maxPods, nodePool)
+		}
+		logger.Error(err, "failed to get node pool", "name", nodePoolName)
+		return err
+	}
+
+	// Node pool exists, check if it needs an update.
+	if existing.MaxPodsConstraint.MaxPodsPerNode != maxPods ||
+		existing.Config.Labels == nil ||
+		existing.Config.Labels[v1alpha1.GKENodePoolLabel] != nodePoolName {
+		logger.Info("node pool template is outdated, recreating", "name", nodePoolName)
+		if err := p.Delete(ctx, &v1alpha1.GCENodeClass{ObjectMeta: metav1.ObjectMeta{Name: strings.TrimPrefix(nodePoolName, "karpenter-")}}); err != nil {
+			return err
+		}
+		return p.createNodePoolTemplate(ctx, imageType, nodePoolName, serviceAccount, maxPods, nodePool)
 	}
 
 	return nil
 }
 
-func (p *DefaultProvider) ensureKarpenterNodePoolTemplate(ctx context.Context, imageType, nodePoolName, serviceAccount string) error {
+func (p *DefaultProvider) createNodePoolTemplate(ctx context.Context, imageType, nodePoolName, serviceAccount string, maxPods int64, nodePool *v1.NodePool) error {
 	logger := log.FromContext(ctx)
+	logger.Info("creating node pool template", "name", nodePoolName)
 
-	// adding simple validation, because previous code was failing
-	// here and no reasonable log was printed out
-	if p.ClusterInfo.Name == "" {
-		return fmt.Errorf("clusterName is required but was empty")
-	}
-	if len(p.ClusterInfo.Zones) == 0 {
-		return fmt.Errorf("no zones provided for node pool %s", nodePoolName)
-	}
-
-	logger.Info("ensuring node pool template exists",
-		"projectID", p.ClusterInfo.ProjectID,
-		"region", p.ClusterInfo.Region,
-		"name", p.ClusterInfo.Name,
-		"nodePoolName", nodePoolName,
-		"zones", p.ClusterInfo.Zones)
-
-	nodePoolSelfLink := fmt.Sprintf("projects/%s/locations/%s/clusters/%s/nodePools/%s",
-		p.ClusterInfo.ProjectID, p.ClusterInfo.Region, p.ClusterInfo.Name, nodePoolName)
-
-	_, err := p.containerService.Projects.Locations.Clusters.NodePools.Get(nodePoolSelfLink).Context(ctx).Do()
-	if err == nil {
-		logger.Info("template node pool already exists", "name", nodePoolName)
-		return nil
-	}
-
-	var gcpErr *googleapi.Error
-	if errors.As(err, &gcpErr) && gcpErr.Code != http.StatusNotFound {
-		logger.Error(err, "Failed to get node pool", "name", nodePoolName, "nodePoolSelfLink", nodePoolSelfLink)
+	clusterSelfLink := fmt.Sprintf("projects/%s/locations/%s/clusters/%s", p.ClusterInfo.ProjectID, p.ClusterInfo.Region, p.ClusterInfo.Name)
+	cluster, err := p.containerService.Projects.Locations.Clusters.Get(clusterSelfLink).Context(ctx).Do()
+	if err != nil {
+		logger.Error(err, "failed to get cluster info for nodepool creation")
 		return err
 	}
 
-	// Prepare request
+	var nodepoolZones *v1.NodeSelectorRequirementWithMinValues
+	for i := range nodePool.Spec.Template.Spec.Requirements {
+		if nodePool.Spec.Template.Spec.Requirements[i].Key == "topology.kubernetes.io/zone" {
+			nodepoolZones = &nodePool.Spec.Template.Spec.Requirements[i]
+			break
+		}
+	}
+
+	if nodepoolZones == nil {
+		return fmt.Errorf("no zones specified in nodepool %s", nodePool.Name)
+	}
+	zones := lo.Intersect(p.ClusterInfo.Zones, nodepoolZones.Values)
+
 	nodePoolOpts := &container.CreateNodePoolRequest{
 		NodePool: &container.NodePool{
-			Name:             nodePoolName,
-			Autoscaling:      &container.NodePoolAutoscaling{Enabled: false},
+			Name: nodePoolName,
+			Autoscaling: &container.NodePoolAutoscaling{
+				Enabled: false,
+			},
 			InitialNodeCount: 0,
-			Locations:        p.ClusterInfo.Zones,
+			Locations:        zones,
 			Config: &container.NodeConfig{
 				ImageType:      imageType,
 				ServiceAccount: serviceAccount,
+				Labels: map[string]string{
+					v1alpha1.GKENodePoolLabel: nodePoolName,
+				},
+			},
+			MaxPodsConstraint: &container.MaxPodsConstraint{
+				MaxPodsPerNode: maxPods,
+			},
+			NetworkConfig: &container.NodeNetworkConfig{
+				PodRange: cluster.IpAllocationPolicy.ClusterSecondaryRangeName,
 			},
 		},
 	}
 
-	logger.Info("creating node pool", "name", nodePoolName)
-	clusterSelfLink := fmt.Sprintf("projects/%s/locations/%s/clusters/%s", p.ClusterInfo.ProjectID, p.ClusterInfo.Region, p.ClusterInfo.Name)
-	_, err = p.containerService.Projects.Locations.Clusters.NodePools.Create(clusterSelfLink, nodePoolOpts).Context(ctx).Do()
+	op, err := p.containerService.Projects.Locations.Clusters.NodePools.Create(clusterSelfLink, nodePoolOpts).Context(ctx).Do()
 	if err != nil {
-		if errors.As(err, &gcpErr) && gcpErr.Code == http.StatusConflict {
-			logger.Info("node pool already created concurrently", "name", nodePoolName)
-			return nil
+		var gcpErr *googleapi.Error
+		if errors.As(err, &gcpErr) {
+			if gcpErr.Code == http.StatusConflict {
+				logger.Info("node pool template already created concurrently", "name", nodePoolName)
+				return nil
+			}
+			if gcpErr.Code == http.StatusBadRequest && strings.Contains(gcpErr.Message, "CLUSTER_ALREADY_HAS_OPERATION") {
+				logger.Info("cluster has a conflicting operation in progress, requeueing", "name", nodePoolName)
+				return fmt.Errorf("cluster has a conflicting operation in progress")
+			}
 		}
-		logger.Error(err, "failed to create node pool", "name", nodePoolName)
+		logger.Error(err, "failed to create node pool template", "name", nodePoolName)
 		return err
 	}
-
-	logger.Info("node pool created successfully", "name", nodePoolName)
+	if err := p.waitForOperation(ctx, op); err != nil {
+		return err
+	}
+	logger.Info("node pool template created", "name", nodePoolName)
 	return nil
+}
+
+func (p *DefaultProvider) waitForOperation(ctx context.Context, op *container.Operation) error {
+	logger := log.FromContext(ctx)
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(5 * time.Second):
+			var err error
+			u, err := url.Parse(op.SelfLink)
+			if err != nil {
+				return fmt.Errorf("parsing operation selfLink %q, %w", op.SelfLink, err)
+			}
+			opName := strings.TrimPrefix(u.Path, "/v1/")
+			op, err = p.containerService.Projects.Locations.Operations.Get(opName).Context(ctx).Do()
+			if err != nil {
+				return fmt.Errorf("polling operation status, %w", err)
+			}
+			if op.Status == "DONE" {
+				if op.Error != nil {
+					return fmt.Errorf("operation failed: %v", op.Error)
+				}
+				logger.Info("gke operation finished", "operation", op.Name, "type", op.OperationType)
+				return nil
+			}
+			logger.Info("waiting for gke operation", "operation", op.Name, "type", op.OperationType, "status", op.Status)
+		}
+	}
 }
 
 func (p *DefaultProvider) GetInstanceTemplates(ctx context.Context) (map[string]*compute.InstanceTemplate, error) {
