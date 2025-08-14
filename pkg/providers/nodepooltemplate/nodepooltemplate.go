@@ -26,6 +26,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/utils"
 	"github.com/samber/lo"
 	"google.golang.org/api/compute/v1"
 	"google.golang.org/api/container/v1"
@@ -121,7 +122,7 @@ func resolveZones(ctx context.Context, computeService *compute.Service, projectI
 }
 
 func (p *DefaultProvider) Create(ctx context.Context, nodeClass *v1alpha1.GCENodeClass, nodePool *v1.NodePool) error {
-	nodePoolName := p.resolveNodePoolName(nodeClass.Name)
+	nodePoolName := utils.ResolveNodePoolName(nodeClass.Name)
 	imageType, err := p.resolveImageType(nodeClass.ImageFamily())
 	if err != nil {
 		log.FromContext(ctx).Error(err, "failed to resolve image type", "nodeClass", nodeClass.Name)
@@ -141,7 +142,7 @@ func (p *DefaultProvider) Create(ctx context.Context, nodeClass *v1alpha1.GCENod
 }
 
 func (p *DefaultProvider) Delete(ctx context.Context, nodeClass *v1alpha1.GCENodeClass) error {
-	nodePoolName := p.resolveNodePoolName(nodeClass.Name)
+	nodePoolName := utils.ResolveNodePoolName(nodeClass.Name)
 	logger := log.FromContext(ctx)
 	logger.Info("deleting node pool template", "name", nodePoolName)
 
@@ -169,10 +170,6 @@ func (p *DefaultProvider) Delete(ctx context.Context, nodeClass *v1alpha1.GCENod
 	}
 	logger.Info("node pool template deleted", "name", nodePoolName)
 	return nil
-}
-
-func (p *DefaultProvider) resolveNodePoolName(nodeClassName string) string {
-	return fmt.Sprintf("karpenter-%s", strings.ToLower(nodeClassName))
 }
 
 func (p *DefaultProvider) resolveImageType(imageFamily string) (string, error) {

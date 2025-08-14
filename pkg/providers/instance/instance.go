@@ -46,7 +46,6 @@ import (
 	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/providers/gke"
 	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/providers/imagefamily"
 	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/providers/metadata"
-	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/providers/nodepooltemplate"
 	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/utils"
 )
 
@@ -171,7 +170,7 @@ func (p *DefaultProvider) createInstance(ctx context.Context, nodeClass *v1alpha
 		return nil, err
 	}
 
-	nodePoolName := resolveNodePoolName(nodeClass.ImageFamily())
+	nodePoolName := utils.ResolveNodePoolName(nodeClass.Name)
 	if nodePoolName == "" {
 		log.FromContext(ctx).Error(err, "failed to resolve node pool name for image family", "imageFamily", nodeClass.ImageFamily())
 		return nil, fmt.Errorf("failed to resolve node pool name for image family %q", nodeClass.ImageFamily())
@@ -313,17 +312,6 @@ func (p *DefaultProvider) selectZone(ctx context.Context, nodeClaim *karpv1.Node
 	}
 
 	return cheapestZone, nil
-}
-
-func resolveNodePoolName(imageFamily string) string {
-	switch imageFamily {
-	case v1alpha1.ImageFamilyContainerOptimizedOS:
-		return nodepooltemplate.KarpenterDefaultNodePoolTemplate
-	case v1alpha1.ImageFamilyUbuntu:
-		return nodepooltemplate.KarpenterUbuntuNodePoolTemplate
-	}
-
-	return ""
 }
 
 //nolint:gocyclo
