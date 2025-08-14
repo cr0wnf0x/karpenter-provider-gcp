@@ -43,7 +43,7 @@ import (
 type Provider interface {
 	Create(ctx context.Context, nodeClass *v1alpha1.GCENodeClass, nodePool *v1.NodePool) error
 	Delete(ctx context.Context, nodeClass *v1alpha1.GCENodeClass) error
-	GetInstanceTemplates(ctx context.Context) (map[string]*compute.InstanceTemplate, error)
+	GetInstanceTemplate(ctx context.Context, nodePoolName string) (*compute.InstanceTemplate, error)
 }
 
 type DefaultProvider struct {
@@ -63,10 +63,8 @@ type ClusterInfo struct {
 }
 
 const (
-	KarpenterDefaultNodePoolTemplate          = "karpenter-default"
 	KarpenterDefaultNodePoolTemplateImageType = "COS_CONTAINERD"
 
-	KarpenterUbuntuNodePoolTemplate          = "karpenter-ubuntu"
 	KarpenterUbuntuNodePoolTemplateImageType = "UBUNTU_CONTAINERD"
 )
 
@@ -312,25 +310,12 @@ func (p *DefaultProvider) waitForOperation(ctx context.Context, op *container.Op
 	}
 }
 
-func (p *DefaultProvider) GetInstanceTemplates(ctx context.Context) (map[string]*compute.InstanceTemplate, error) {
-	ret := map[string]*compute.InstanceTemplate{}
-	defaultTemplate, err := p.getInstanceTemplate(ctx, KarpenterDefaultNodePoolTemplate)
+func (p *DefaultProvider) GetInstanceTemplate(ctx context.Context, nodePoolName string) (*compute.InstanceTemplate, error) {
+	defaultTemplate, err := p.getInstanceTemplate(ctx, nodePoolName)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("getting instance template for node pool %s: %w", nodePoolName, err)
 	}
-	if defaultTemplate != nil {
-		ret[KarpenterDefaultNodePoolTemplate] = defaultTemplate
-	}
-
-	ubuntuTemplate, err := p.getInstanceTemplate(ctx, KarpenterUbuntuNodePoolTemplate)
-	if err != nil {
-		return nil, err
-	}
-	if ubuntuTemplate != nil {
-		ret[KarpenterUbuntuNodePoolTemplate] = ubuntuTemplate
-	}
-
-	return ret, nil
+	return defaultTemplate, nil
 }
 
 func (p *DefaultProvider) getNodePool(ctx context.Context, nodePoolName string) (*container.NodePool, error) {
