@@ -38,6 +38,9 @@ func (u *Ubuntu) ResolveImages(ctx context.Context, nodePoolName, version string
 		log.FromContext(ctx).Error(err, "Failed to get source image")
 		return Images{}, err
 	}
+	if sourceImage == "" {
+		return nil, nil
+	}
 
 	if version != "latest" {
 		re := regexp.MustCompile(`v\d+$`)

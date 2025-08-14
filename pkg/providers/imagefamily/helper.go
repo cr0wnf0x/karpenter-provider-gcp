@@ -42,6 +42,9 @@ func getSourceImage(ctx context.Context, provider nodepooltemplate.Provider, nod
 	if err != nil {
 		return "", fmt.Errorf("failed to get default node template: %w", err)
 	}
+	if defaultNodeTemplate == nil {
+		return "", nil
+	}
 
 	systemDisk, ok := lo.Find(defaultNodeTemplate.Properties.Disks, func(item *compute.AttachedDisk) bool {
 		return item.Boot

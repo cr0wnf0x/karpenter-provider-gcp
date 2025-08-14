@@ -85,7 +85,7 @@ func NewDefaultProvider(ctx context.Context, kubeClient client.Client, computeSe
 		ClusterInfo: ClusterInfo{
 			ProjectID: projectID,
 			Region:    region,
-			Name:      clusterName,
+			Name:      strings.TrimSuffix(clusterName, "."),
 			Zones:     zones,
 		},
 	}
@@ -323,6 +323,11 @@ func (p *DefaultProvider) getNodePool(ctx context.Context, nodePoolName string) 
 		p.ClusterInfo.ProjectID, p.ClusterInfo.Region, p.ClusterInfo.Name, nodePoolName)
 	nodePool, err := p.containerService.Projects.Locations.Clusters.NodePools.Get(nodePoolSelfLink).Context(ctx).Do()
 	if err != nil {
+		var gerr *googleapi.Error
+		if errors.As(err, &gerr) && gerr.Code == http.StatusNotFound {
+			log.FromContext(ctx).Info("node pool not found", "name", nodePoolName)
+			return nil, nil // Not found is not an error
+		}
 		log.FromContext(ctx).Error(err, "error getting node pool")
 		return nil, err
 	}
@@ -332,32 +337,27 @@ func (p *DefaultProvider) getNodePool(ctx context.Context, nodePoolName string) 
 func (p *DefaultProvider) getInstanceTemplate(ctx context.Context, nodePoolName string) (*compute.InstanceTemplate, error) {
 	logger := log.FromContext(ctx)
 
-	if p.ClusterInfo.ProjectID == "" || p.ClusterInfo.Name == "" || p.ClusterInfo.Region == "" {
-		return nil, fmt.Errorf("ClusterInfo not initialized")
-	}
-
-	nodePool, err := p.getNodePool(ctx, nodePoolName)
-	if err != nil {
+	if err := p.validateClusterInfo(); err != nil {
 		return nil, err
 	}
 
-	if nodePool.Status != "RUNNING" {
-		return nil, nil
+	nodePool, err := p.getNodePool(ctx, nodePoolName)
+	if err != nil || nodePool == nil || nodePool.Status != "RUNNING" {
+		return nil, err
 	}
 
 	if len(nodePool.InstanceGroupUrls) == 0 {
 		return nil, fmt.Errorf("no instance group URLs found for node pool: %s", nodePoolName)
 	}
 
-	zone, managerName, err := resolveInstanceGroupZoneAndManagerName(nodePool.InstanceGroupUrls[0])
+	location, managerName, isRegional, err := resolveInstanceGroupZoneAndManagerName(nodePool.InstanceGroupUrls[0])
 	if err != nil {
 		logger.Error(err, "error resolving instance group URL")
 		return nil, err
 	}
 
-	ig, err := p.computeService.InstanceGroupManagers.Get(p.ClusterInfo.ProjectID, zone, managerName).Do()
+	ig, err := p.getInstanceGroupManager(location, managerName, isRegional)
 	if err != nil {
-		logger.Error(err, "error getting instance group manager")
 		return nil, err
 	}
 
@@ -366,12 +366,36 @@ func (p *DefaultProvider) getInstanceTemplate(ctx context.Context, nodePoolName 
 		return nil, err
 	}
 
+	return p.getRegionalInstanceTemplate(ctx, templateName)
+}
+
+func (p *DefaultProvider) validateClusterInfo() error {
+	if p.ClusterInfo.ProjectID == "" || p.ClusterInfo.Name == "" || p.ClusterInfo.Region == "" {
+		return fmt.Errorf("ClusterInfo not initialized")
+	}
+	return nil
+}
+
+func (p *DefaultProvider) getInstanceGroupManager(location, managerName string, isRegional bool) (*compute.InstanceGroupManager, error) {
+	if isRegional {
+		ig, err := p.computeService.RegionInstanceGroupManagers.Get(p.ClusterInfo.ProjectID, location, managerName).Do()
+		if err != nil {
+			return nil, fmt.Errorf("getting instance group manager: %w", err)
+		}
+		return ig, nil
+	}
+	ig, err := p.computeService.InstanceGroupManagers.Get(p.ClusterInfo.ProjectID, location, managerName).Do()
+	if err != nil {
+		return nil, fmt.Errorf("getting instance group manager: %w", err)
+	}
+	return ig, nil
+}
+
+func (p *DefaultProvider) getRegionalInstanceTemplate(ctx context.Context, templateName string) (*compute.InstanceTemplate, error) {
 	template, err := p.computeService.RegionInstanceTemplates.Get(p.ClusterInfo.ProjectID, p.ClusterInfo.Region, templateName).Context(ctx).Do()
 	if err != nil {
-		logger.Error(err, "error getting instance template")
-		return nil, err
+		return nil, fmt.Errorf("getting instance template: %w", err)
 	}
-
 	return template, nil
 }
 
@@ -393,22 +417,20 @@ func resolveInstanceTemplateName(instanceTemplateURL string) (string, error) {
 	return "", fmt.Errorf("invalid instance template URL: %s", instanceTemplateURL)
 }
 
-func resolveInstanceGroupZoneAndManagerName(instanceGroupURL string) (string, string, error) {
+func resolveInstanceGroupZoneAndManagerName(instanceGroupURL string) (string, string, bool, error) {
 	parsedURL, err := url.Parse(instanceGroupURL)
 	if err != nil {
-		return "", "", err
+		return "", "", false, err
 	}
 
 	parts := strings.Split(strings.Trim(parsedURL.Path, "/"), "/")
-
-	// Ensure the path has enough components to extract zone and instance group manager name
-	if len(parts) < 8 || parts[4] != "zones" || parts[6] != "instanceGroupManagers" {
-		return "", "", fmt.Errorf("invalid instance group URL: %s", instanceGroupURL)
+	for i, p := range parts {
+		if p == "instanceGroupManagers" && i > 1 && i+1 < len(parts) {
+			locationType := parts[i-2]
+			if locationType == "zones" || locationType == "regions" {
+				return parts[i-1], parts[i+1], locationType == "regions", nil
+			}
+		}
 	}
-
-	// Extract zone and instance group manager name
-	zone := parts[5]
-	instanceGroupManagerName := parts[7]
-
-	return zone, instanceGroupManagerName, nil
+	return "", "", false, fmt.Errorf("invalid instance group URL: %s", instanceGroupURL)
 }

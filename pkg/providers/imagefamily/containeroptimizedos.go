@@ -39,6 +39,9 @@ func (c *ContainerOptimizedOS) ResolveImages(ctx context.Context, nodePoolName, 
 		log.FromContext(ctx).Error(err, "unable to get sourceImage")
 		return nil, err
 	}
+	if sourceImage == "" {
+		return nil, nil
+	}
 
 	if version == "latest" {
 		return c.resolveImages(sourceImage), nil
