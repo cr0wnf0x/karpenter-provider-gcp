@@ -22,24 +22,22 @@ import (
 
 	"github.com/mitchellh/hashstructure/v2"
 	"github.com/samber/lo"
-	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
-	"sigs.k8s.io/controller-runtime/pkg/handler"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-	"sigs.k8s.io/karpenter/pkg/apis/v1"
-
-	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/apis/v1alpha1"
-	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/providers/nodepooltemplate"
-
 	controllerruntime "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+
+	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/apis/v1alpha1"
+	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/providers/nodepooltemplate"
 )
 
 const (
-	finalizer       = "karpenter.k8s.gcp/nodepooltemplate"
-	annotationKey   = "karpenter.k8s.gcp/gcenodeclass-hash"
+	finalizer     = "karpenter.k8s.gcp/nodepooltemplate"
+	annotationKey = "karpenter.k8s.gcp/gcenodeclass-hash"
 )
 
 // Controller for the resource
@@ -61,21 +59,15 @@ func (c *Controller) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	// 1. Read the nodepool
 	nodePool := &v1.NodePool{}
 	if err := c.kubeClient.Get(ctx, req.NamespacedName, nodePool); err != nil {
-		if errors.IsNotFound(err) {
-			return reconcile.Result{}, nil
-		}
-		return reconcile.Result{}, err
+		return reconcile.Result{}, client.IgnoreNotFound(err)
 	}
 
 	// 2. Read the gce node class
 	gceNodeClass := &v1alpha1.GCENodeClass{}
 	if err := c.kubeClient.Get(ctx, types.NamespacedName{Name: nodePool.Spec.Template.Spec.NodeClassRef.Name}, gceNodeClass); err != nil {
-		if errors.IsNotFound(err) {
-			// If the node class doesn't exist, we don't need to do anything.
-			// If the node pool is deleted, the finalizer will be removed.
-			return reconcile.Result{}, nil
-		}
-		return reconcile.Result{}, err
+		// If the node class doesn't exist, we don't need to do anything.
+		// If the node pool is deleted, the finalizer will be removed.
+		return reconcile.Result{}, client.IgnoreNotFound(err)
 	}
 
 	// 3. Handle deletion
@@ -83,6 +75,10 @@ func (c *Controller) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		return c.delete(ctx, nodePool, gceNodeClass)
 	}
 
+	return c.reconcile(ctx, nodePool, gceNodeClass)
+}
+
+func (c *Controller) reconcile(ctx context.Context, nodePool *v1.NodePool, gceNodeClass *v1alpha1.GCENodeClass) (reconcile.Result, error) {
 	// 4. Add finalizer
 	if !controllerutil.ContainsFinalizer(nodePool, finalizer) {
 		controllerutil.AddFinalizer(nodePool, finalizer)

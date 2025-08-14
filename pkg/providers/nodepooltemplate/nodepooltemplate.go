@@ -29,13 +29,13 @@ import (
 	"google.golang.org/api/compute/v1"
 	"google.golang.org/api/container/v1"
 	"google.golang.org/api/googleapi"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/karpenter/pkg/apis/v1"
+	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 
 	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/apis/v1alpha1"
 	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/providers/version"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 type Provider interface {
@@ -150,9 +150,15 @@ func (p *DefaultProvider) Delete(ctx context.Context, nodeClass *v1alpha1.GCENod
 	op, err := p.containerService.Projects.Locations.Clusters.NodePools.Delete(nodePoolSelfLink).Context(ctx).Do()
 	if err != nil {
 		var gcpErr *googleapi.Error
-		if errors.As(err, &gcpErr) && gcpErr.Code == http.StatusNotFound {
-			logger.Info("node pool template already deleted", "name", nodePoolName)
-			return nil
+		if errors.As(err, &gcpErr) {
+			if gcpErr.Code == http.StatusNotFound {
+				logger.Info("node pool template already deleted", "name", nodePoolName)
+				return nil
+			}
+			if gcpErr.Code == http.StatusBadRequest && strings.Contains(gcpErr.Message, "CLUSTER_ALREADY_HAS_OPERATION") {
+				logger.Info("cluster has a conflicting operation in progress, requeueing delete", "name", nodePoolName)
+				return fmt.Errorf("cluster has a conflicting operation in progress")
+			}
 		}
 		logger.Error(err, "failed to delete node pool template", "name", nodePoolName)
 		return err
@@ -210,29 +216,49 @@ func (p *DefaultProvider) createNodePoolTemplate(ctx context.Context, imageType,
 	logger := log.FromContext(ctx)
 	logger.Info("creating node pool template", "name", nodePoolName)
 
+	clusterSelfLink := fmt.Sprintf("projects/%s/locations/%s/clusters/%s", p.ClusterInfo.ProjectID, p.ClusterInfo.Region, p.ClusterInfo.Name)
+	cluster, err := p.containerService.Projects.Locations.Clusters.Get(clusterSelfLink).Context(ctx).Do()
+	if err != nil {
+		logger.Error(err, "failed to get cluster info for nodepool creation")
+		return err
+	}
+
 	nodePoolOpts := &container.CreateNodePoolRequest{
 		NodePool: &container.NodePool{
-			Name:             nodePoolName,
-			Autoscaling:      &container.NodePoolAutoscaling{Enabled: false},
+			Name: nodePoolName,
+			Autoscaling: &container.NodePoolAutoscaling{
+				Enabled: false,
+			},
 			InitialNodeCount: 0,
 			Locations:        p.ClusterInfo.Zones,
 			Config: &container.NodeConfig{
 				ImageType:      imageType,
 				ServiceAccount: serviceAccount,
+				Labels: map[string]string{
+					"cloud.google.com/gke-nodepool": nodePoolName,
+				},
 			},
 			MaxPodsConstraint: &container.MaxPodsConstraint{
 				MaxPodsPerNode: maxPods,
 			},
+			NetworkConfig: &container.NodeNetworkConfig{
+				PodRange: cluster.IpAllocationPolicy.ClusterSecondaryRangeName,
+			},
 		},
 	}
 
-	clusterSelfLink := fmt.Sprintf("projects/%s/locations/%s/clusters/%s", p.ClusterInfo.ProjectID, p.ClusterInfo.Region, p.ClusterInfo.Name)
 	op, err := p.containerService.Projects.Locations.Clusters.NodePools.Create(clusterSelfLink, nodePoolOpts).Context(ctx).Do()
 	if err != nil {
 		var gcpErr *googleapi.Error
-		if errors.As(err, &gcpErr) && gcpErr.Code == http.StatusConflict {
-			logger.Info("node pool template already created concurrently", "name", nodePoolName)
-			return nil
+		if errors.As(err, &gcpErr) {
+			if gcpErr.Code == http.StatusConflict {
+				logger.Info("node pool template already created concurrently", "name", nodePoolName)
+				return nil
+			}
+			if gcpErr.Code == http.StatusBadRequest && strings.Contains(gcpErr.Message, "CLUSTER_ALREADY_HAS_OPERATION") {
+				logger.Info("cluster has a conflicting operation in progress, requeueing", "name", nodePoolName)
+				return fmt.Errorf("cluster has a conflicting operation in progress")
+			}
 		}
 		logger.Error(err, "failed to create node pool template", "name", nodePoolName)
 		return err
@@ -252,7 +278,12 @@ func (p *DefaultProvider) waitForOperation(ctx context.Context, op *container.Op
 			return ctx.Err()
 		case <-time.After(5 * time.Second):
 			var err error
-			op, err = p.containerService.Projects.Locations.Operations.Get(op.SelfLink).Context(ctx).Do()
+			u, err := url.Parse(op.SelfLink)
+			if err != nil {
+				return fmt.Errorf("parsing operation selfLink %q, %w", op.SelfLink, err)
+			}
+			opName := strings.TrimPrefix(u.Path, "/v1/")
+			op, err = p.containerService.Projects.Locations.Operations.Get(opName).Context(ctx).Do()
 			if err != nil {
 				return fmt.Errorf("polling operation status, %w", err)
 			}
